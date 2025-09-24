@@ -62,30 +62,27 @@ jobs:
           unzip -oq "$ZIP_NAME" -d "../$WORKING_DIR"
           export ZIP_NAME
           popd >/dev/null
-
-          python <<'PY'
-import os, re, sys
-zip_name = os.environ.get("ZIP_NAME")
-if not zip_name:
-    sys.exit("ZIP_NAME environment variable is missing")
-match = re.search(r'chevereto_([0-9.]+)', zip_name)
-if not match:
-    sys.exit(f"Unable to determine Chevereto version from {zip_name}")
-version = match.group(1).lstrip('vV')
-parts = version.split('.')
-major = parts[0]
-minor = parts[1] if len(parts) > 1 else '0'
-patch = parts[2] if len(parts) > 2 else '0'
-tags = [major, f"{major}.{minor}", f"{major}.{minor}.{patch}"]
-with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
-    fh.write(f"version={version}\n")
-    fh.write("tags=" + " ".join(tags) + "\n")
-PY
+          VERSION_FROM_ZIP=$(printf '%s\n' "$ZIP_NAME" | sed -n "s/^chevereto_\([0-9.]*\).*$/\1/p")
+          VERSION_FROM_ZIP=${VERSION_FROM_ZIP#v}
+          VERSION_FROM_ZIP=${VERSION_FROM_ZIP#V}
+          if [ -z "$VERSION_FROM_ZIP" ]; then
+            echo "Unable to determine Chevereto version from $ZIP_NAME" >&2
+            exit 1
+          fi
+          IFS='.' read -r MAJOR MINOR PATCH <<<"$VERSION_FROM_ZIP"
+          MINOR=${MINOR:-0}
+          PATCH=${PATCH:-0}
+          TAG_LIST="$MAJOR $MAJOR.${MINOR} $MAJOR.${MINOR}.${PATCH}"
+          {
+            printf 'version=%s\n' "$VERSION_FROM_ZIP"
+            printf 'tags=%s\n' "$TAG_LIST"
+          } >>"$GITHUB_OUTPUT"
 
           rm -rf "$DOWNLOAD_DIR"
 
       - name: Show resolved version
-        run: echo "Resolved package version: ${{ steps.prep.outputs.version }}"
+        run: |
+          echo "Resolved package version: ${{ steps.prep.outputs.version }}"
 
       - name: Login to GHCR for registry check
         if: github.event_name == 'schedule'
@@ -118,37 +115,39 @@ PY
           echo "Inspecting ${HOST}/${IMAGE_PATH}"
           RESP=$(curl -fsSL -u "${GH_ACTOR}:${GH_TOKEN}" "https://${HOST}/v2/${IMAGE_PATH}/tags/list" || true)
           export RESP_JSON="$RESP"
-          python <<'PY'
-import json, os, re
-output_path = os.environ["GITHUB_OUTPUT"]
-package_version = os.environ.get("PACKAGE_VERSION", "").strip()
-resp_json = os.environ.get("RESP_JSON", "")
-latest_tag = ""
-should_build = True
-if resp_json:
-    try:
-        data = json.loads(resp_json)
-        tags = data.get("tags", [])
-        semver = []
-        for tag in tags:
-            if re.fullmatch(r"\d+\.\d+\.\d+", tag):
-                parts = tuple(int(p) for p in tag.split('.'))
-                semver.append((parts, tag))
-        if semver:
-            latest_tag = max(semver, key=lambda item: item[0])[1]
-            should_build = latest_tag != package_version
-    except Exception as exc:
-        print(f"Failed to parse registry response: {exc}")
-with open(output_path, "a", encoding="utf-8") as fh:
-    fh.write(f"latest_tag={latest_tag}\n")
-    fh.write(f"should_build={'true' if should_build else 'false'}\n")
-if latest_tag:
-    print(f"Latest registry patch tag: {latest_tag}")
-else:
-    print("No existing patch tags found in registry.")
-if not should_build:
-    print("Registry already has the current package version; skipping build.")
-PY
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "jq is required to parse registry tags" >&2
+            exit 1
+          fi
+
+          LATEST_TAG=""
+          if [ -n "$RESP_JSON" ]; then
+            LATEST_TAG=$(printf '%s' "$RESP_JSON" |
+              jq -r '[.tags[]? | select(test("^\\d+\\.\\d+\\.\\d+$"))] | sort_by(split(".") | map(tonumber)) | last // empty' 2>/dev/null || true)
+          fi
+
+          SHOULD_BUILD=true
+          if [ -n "$PACKAGE_VERSION" ] && [ "$LATEST_TAG" = "$PACKAGE_VERSION" ]; then
+            SHOULD_BUILD=false
+          fi
+
+          {
+            printf 'latest_tag=%s\n' "$LATEST_TAG"
+            if [ "$SHOULD_BUILD" = true ]; then
+              printf 'should_build=true\n'
+            else
+              printf 'should_build=false\n'
+            fi
+          } >>"$GITHUB_OUTPUT"
+
+          if [ -n "$LATEST_TAG" ]; then
+            echo "Latest registry patch tag: $LATEST_TAG"
+          else
+            echo "No existing patch tags found in registry."
+          fi
+          if [ "$SHOULD_BUILD" != true ]; then
+            echo "Registry already has the current package version; skipping build."
+          fi
 
       - name: Skip build (already up-to-date)
         if: github.event_name == 'schedule' && steps.registry.outputs.should_build == 'false'
