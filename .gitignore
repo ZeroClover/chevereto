@@ -1,0 +1,8 @@
+.DS_Store
+/.env
+/.temp
+/.well-known
+/chevereto
+/letsencrypt
+/namespace/dev
+/backup

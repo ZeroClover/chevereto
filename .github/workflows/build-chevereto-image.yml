@@ -1,0 +1,197 @@
+name: Build Chevereto Image
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Chevereto package version (e.g. 4.3.5)"
+        required: false
+        default: "4"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: chevereto
+  IMAGE_REGISTRY: ${{ vars.CHEVERETO_IMAGE_REGISTRY || 'ghcr.io/zeroclover/chevereto' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Ensure license key secret exists
+        run: |
+          if [ -z "${{ secrets.CHEVERETO_LICENSE_KEY }}" ]; then
+            echo "CHEVERETO_LICENSE_KEY secret is required to fetch the pro package." >&2
+            exit 1
+          fi
+
+      - name: Prepare Chevereto package
+        id: prep
+        env:
+          VERSION_INPUT: ${{ github.event.inputs.version }}
+          CHEVERETO_LICENSE_KEY: ${{ secrets.CHEVERETO_LICENSE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION_INPUT:-4}"
+          if [ -z "$VERSION" ]; then
+            VERSION="4"
+          fi
+
+          DOWNLOAD_DIR=".temp"
+          WORKING_DIR="chevereto"
+          rm -rf "$DOWNLOAD_DIR" "$WORKING_DIR"
+          mkdir -p "$DOWNLOAD_DIR" "$WORKING_DIR"
+          API_DOWNLOAD="https://chevereto.com/api/download/"
+
+          echo "Downloading Chevereto package ${VERSION}"
+          pushd "$DOWNLOAD_DIR" >/dev/null
+          curl -fsSLJO -H "License: ${CHEVERETO_LICENSE_KEY}" "${API_DOWNLOAD}${VERSION}"
+          ZIP_NAME=$(ls -1 *.zip | head -n1)
+          if [ -z "$ZIP_NAME" ]; then
+            echo "Download did not produce a zip file" >&2
+            exit 1
+          fi
+          unzip -oq "$ZIP_NAME" -d "../$WORKING_DIR"
+          export ZIP_NAME
+          popd >/dev/null
+
+          python <<'PY'
+import os, re, sys
+zip_name = os.environ.get("ZIP_NAME")
+if not zip_name:
+    sys.exit("ZIP_NAME environment variable is missing")
+match = re.search(r'chevereto_([0-9.]+)', zip_name)
+if not match:
+    sys.exit(f"Unable to determine Chevereto version from {zip_name}")
+version = match.group(1).lstrip('vV')
+parts = version.split('.')
+major = parts[0]
+minor = parts[1] if len(parts) > 1 else '0'
+patch = parts[2] if len(parts) > 2 else '0'
+tags = [major, f"{major}.{minor}", f"{major}.{minor}.{patch}"]
+with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+    fh.write(f"version={version}\n")
+    fh.write("tags=" + " ".join(tags) + "\n")
+PY
+
+          rm -rf "$DOWNLOAD_DIR"
+
+      - name: Show resolved version
+        run: echo "Resolved package version: ${{ steps.prep.outputs.version }}"
+
+      - name: Login to GHCR for registry check
+        if: github.event_name == 'schedule'
+        uses: docker/login-action@v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check existing registry version
+        if: github.event_name == 'schedule'
+        id: registry
+        env:
+          IMAGE_REGISTRY: ${{ env.IMAGE_REGISTRY }}
+          PACKAGE_VERSION: ${{ steps.prep.outputs.version }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REGISTRY="${IMAGE_REGISTRY:-ghcr.io/zeroclover/chevereto}"
+          REGISTRY="${REGISTRY#https://}"
+          REGISTRY="${REGISTRY#http://}"
+          HOST="${REGISTRY%%/*}"
+          IMAGE_PATH="${REGISTRY#${HOST}/}"
+          if [ -z "$IMAGE_PATH" ] || [ "$IMAGE_PATH" = "$REGISTRY" ]; then
+            echo "IMAGE_REGISTRY must include an image path (e.g. ghcr.io/owner/chevereto)." >&2
+            exit 1
+          fi
+          echo "Inspecting ${HOST}/${IMAGE_PATH}"
+          RESP=$(curl -fsSL -u "${GH_ACTOR}:${GH_TOKEN}" "https://${HOST}/v2/${IMAGE_PATH}/tags/list" || true)
+          export RESP_JSON="$RESP"
+          python <<'PY'
+import json, os, re
+output_path = os.environ["GITHUB_OUTPUT"]
+package_version = os.environ.get("PACKAGE_VERSION", "").strip()
+resp_json = os.environ.get("RESP_JSON", "")
+latest_tag = ""
+should_build = True
+if resp_json:
+    try:
+        data = json.loads(resp_json)
+        tags = data.get("tags", [])
+        semver = []
+        for tag in tags:
+            if re.fullmatch(r"\d+\.\d+\.\d+", tag):
+                parts = tuple(int(p) for p in tag.split('.'))
+                semver.append((parts, tag))
+        if semver:
+            latest_tag = max(semver, key=lambda item: item[0])[1]
+            should_build = latest_tag != package_version
+    except Exception as exc:
+        print(f"Failed to parse registry response: {exc}")
+with open(output_path, "a", encoding="utf-8") as fh:
+    fh.write(f"latest_tag={latest_tag}\n")
+    fh.write(f"should_build={'true' if should_build else 'false'}\n")
+if latest_tag:
+    print(f"Latest registry patch tag: {latest_tag}")
+else:
+    print("No existing patch tags found in registry.")
+if not should_build:
+    print("Registry already has the current package version; skipping build.")
+PY
+
+      - name: Skip build (already up-to-date)
+        if: github.event_name == 'schedule' && steps.registry.outputs.should_build == 'false'
+        run: echo "Chevereto image already up to date on registry."
+
+      - name: Set up Docker Buildx
+        if: github.event_name != 'schedule' || steps.registry.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v3.11.1
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'schedule'
+        uses: docker/login-action@v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        if: github.event_name != 'schedule' || steps.registry.outputs.should_build == 'true'
+        env:
+          TAGS: ${{ steps.prep.outputs.tags }}
+          IMAGE_REGISTRY: ${{ env.IMAGE_REGISTRY }}
+          PACKAGE_VERSION: ${{ steps.prep.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REGISTRY="${IMAGE_REGISTRY:-ghcr.io/zeroclover/chevereto}"
+          REGISTRY="${REGISTRY#https://}"
+          REGISTRY="${REGISTRY#http://}"
+          if [[ "$REGISTRY" != */* ]]; then
+            echo "IMAGE_REGISTRY must include an image path (e.g. ghcr.io/owner/chevereto)." >&2
+            exit 1
+          fi
+          IMAGE_REPO="${REGISTRY,,}"
+          echo "Publishing ${IMAGE_REPO} with tags: ${TAGS}"
+          read -ra TAG_LIST <<<"${TAGS}"
+          TAG_ARGS=()
+          for tag in "${TAG_LIST[@]}"; do
+            TAG_ARGS+=("--tag" "${IMAGE_REPO}:${tag}")
+          done
+          LABEL_ARGS=(
+            "--label" "org.opencontainers.image.version=${PACKAGE_VERSION}"
+            "--label" "org.opencontainers.image.revision=${GITHUB_SHA}"
+            "--label" "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+          )
+          docker buildx build --push "${TAG_ARGS[@]}" "${LABEL_ARGS[@]}" .
