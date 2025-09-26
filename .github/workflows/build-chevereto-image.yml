@@ -244,7 +244,7 @@ jobs:
         run: |
           mkdir -p /tmp/digests
           digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          echo "${{ env.IMAGE_REGISTRY }}@${digest}" > "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
         uses: actions/upload-artifact@v4
@@ -299,7 +299,7 @@ jobs:
           read -ra TAG_LIST <<<"${TAGS}"
           docker buildx imagetools create \
             $(printf -- "--tag %s:%s " "${IMAGE_REPO}" "${TAG_LIST[@]}") \
-            $(printf '%s@sha256:%s ' "${IMAGE_REPO}" *)
+            $(cat * | tr '\n' ' ')
 
       - name: Inspect image
         env:
