@@ -297,9 +297,17 @@ jobs:
           IMAGE_REPO="${REGISTRY,,}"
 
           read -ra TAG_LIST <<<"${TAGS}"
-          docker buildx imagetools create \
-            $(printf -- "--tag %s:%s " "${IMAGE_REPO}" "${TAG_LIST[@]}") \
-            $(cat * | tr '\n' ' ')
+
+          # Build tag arguments
+          TAG_ARGS=()
+          for tag in "${TAG_LIST[@]}"; do
+            TAG_ARGS+=("--tag" "${IMAGE_REPO}:${tag}")
+          done
+
+          # Build source digest arguments
+          DIGEST_ARGS=($(cat * | tr '\n' ' '))
+
+          docker buildx imagetools create "${TAG_ARGS[@]}" "${DIGEST_ARGS[@]}"
 
       - name: Inspect image
         env:
