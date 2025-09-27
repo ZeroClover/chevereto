@@ -103,41 +103,26 @@ jobs:
         env:
           IMAGE_REGISTRY: ${{ env.IMAGE_REGISTRY }}
           PACKAGE_VERSION: ${{ steps.prep.outputs.version }}
-          GH_ACTOR: ${{ github.actor }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
           REGISTRY="${IMAGE_REGISTRY:-ghcr.io/zeroclover/chevereto}"
           REGISTRY="${REGISTRY#https://}"
           REGISTRY="${REGISTRY#http://}"
-          HOST="${REGISTRY%%/*}"
-          IMAGE_PATH="${REGISTRY#${HOST}/}"
-          if [ -z "$IMAGE_PATH" ] || [ "$IMAGE_PATH" = "$REGISTRY" ]; then
-            echo "IMAGE_REGISTRY must include an image path (e.g. ghcr.io/owner/chevereto)." >&2
-            exit 1
-          fi
-          echo "Inspecting ${HOST}/${IMAGE_PATH}"
-          RESP=$(curl -fsSL -u "${GH_ACTOR}:${GH_TOKEN}" "https://${HOST}/v2/${IMAGE_PATH}/tags/list" || true)
-          export RESP_JSON="$RESP"
-          if ! command -v jq >/dev/null 2>&1; then
-            echo "jq is required to parse registry tags" >&2
-            exit 1
-          fi
 
-          LATEST_TAG=""
-          if [ -n "$RESP_JSON" ]; then
-            LATEST_TAG=$(printf '%s' "$RESP_JSON" |
-              jq -r '[.tags[]? | select(test("^\\d+\\.\\d+\\.\\d+$"))] | sort_by(split(".") | map(tonumber)) | last // empty' 2>/dev/null || true)
-          fi
+          echo "Checking if image ${REGISTRY}:${PACKAGE_VERSION} exists"
 
+          # Use docker manifest inspect to check if the image with current version exists
           SHOULD_BUILD=true
-          if [ -n "$PACKAGE_VERSION" ] && [ "$LATEST_TAG" = "$PACKAGE_VERSION" ]; then
+          if docker manifest inspect "${REGISTRY}:${PACKAGE_VERSION}" >/dev/null 2>&1; then
+            echo "Image ${REGISTRY}:${PACKAGE_VERSION} already exists in registry"
             SHOULD_BUILD=false
+          else
+            echo "Image ${REGISTRY}:${PACKAGE_VERSION} not found in registry, will build"
           fi
 
           {
-            printf 'latest_tag=%s\n' "$LATEST_TAG"
+            printf 'latest_tag=%s\n' "$PACKAGE_VERSION"
             if [ "$SHOULD_BUILD" = true ]; then
               printf 'should_build=true\n'
             else
@@ -145,11 +130,6 @@ jobs:
             fi
           } >>"$GITHUB_OUTPUT"
 
-          if [ -n "$LATEST_TAG" ]; then
-            echo "Latest registry patch tag: $LATEST_TAG"
-          else
-            echo "No existing patch tags found in registry."
-          fi
           if [ "$SHOULD_BUILD" != true ]; then
             echo "Registry already has the current package version; skipping build."
           fi
