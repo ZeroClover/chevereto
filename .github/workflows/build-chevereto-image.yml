@@ -9,6 +9,11 @@ on:
         description: "Chevereto package version (e.g. 4.3.5)"
         required: false
         default: "4"
+      skip_if_exists:
+        description: "Skip build if image already exists in registry"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -90,7 +95,7 @@ jobs:
           echo "Resolved package version: ${{ steps.prep.outputs.version }}"
 
       - name: Login to GHCR for registry check
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.skip_if_exists == 'true')
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -98,7 +103,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check existing registry version
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.skip_if_exists == 'true')
         id: registry
         env:
           IMAGE_REGISTRY: ${{ env.IMAGE_REGISTRY }}
@@ -135,13 +140,13 @@ jobs:
           fi
 
       - name: Skip build (already up-to-date)
-        if: github.event_name == 'schedule' && steps.registry.outputs.should_build == 'false'
+        if: (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.skip_if_exists == 'true')) && steps.registry.outputs.should_build == 'false'
         run: echo "Chevereto image already up to date on registry."
 
   # Multi-architecture build job
   build:
     needs: prepare
-    if: github.event_name != 'schedule' || needs.prepare.outputs.should_build == 'true'
+    if: (github.event_name != 'schedule' && github.event_name != 'workflow_dispatch') || (github.event_name == 'schedule' && needs.prepare.outputs.should_build == 'true') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.skip_if_exists != 'true' || needs.prepare.outputs.should_build == 'true'))
     strategy:
       matrix:
         include:
@@ -240,7 +245,7 @@ jobs:
     needs:
       - prepare
       - build
-    if: github.event_name != 'schedule' || needs.prepare.outputs.should_build == 'true'
+    if: (github.event_name != 'schedule' && github.event_name != 'workflow_dispatch') || (github.event_name == 'schedule' && needs.prepare.outputs.should_build == 'true') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.skip_if_exists != 'true' || needs.prepare.outputs.should_build == 'true'))
     steps:
       - name: Download digests
         uses: actions/download-artifact@v4
