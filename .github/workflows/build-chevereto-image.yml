@@ -24,7 +24,7 @@ env:
   IMAGE_REGISTRY: ${{ vars.CHEVERETO_IMAGE_REGISTRY || 'ghcr.io/zeroclover/chevereto' }}
 
 jobs:
-  # Prepare job to determine version and check if build is needed
+  # Prepare job: download the package once, resolve version, share via artifact
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -35,10 +35,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Ensure license key secret exists
+      - name: Ensure required secrets exist
         run: |
           if [ -z "${{ secrets.CHEVERETO_LICENSE_KEY }}" ]; then
             echo "CHEVERETO_LICENSE_KEY secret is required to fetch the pro package." >&2
+            exit 1
+          fi
+          if [ -z "${{ secrets.CHEVERETO_DOWNLOAD_PROXY }}" ]; then
+            echo "CHEVERETO_DOWNLOAD_PROXY secret is required; GitHub-hosted runner IPs are blocked by Cloudflare." >&2
             exit 1
           fi
 
@@ -47,6 +51,7 @@ jobs:
         env:
           VERSION_INPUT: ${{ github.event.inputs.version }}
           CHEVERETO_LICENSE_KEY: ${{ secrets.CHEVERETO_LICENSE_KEY }}
+          CHEVERETO_DOWNLOAD_PROXY: ${{ secrets.CHEVERETO_DOWNLOAD_PROXY }}
         shell: bash
         run: |
           set -euo pipefail
@@ -55,23 +60,31 @@ jobs:
             VERSION="4"
           fi
 
-          DOWNLOAD_DIR=".temp"
-          WORKING_DIR="chevereto"
-          rm -rf "$DOWNLOAD_DIR" "$WORKING_DIR"
-          mkdir -p "$DOWNLOAD_DIR" "$WORKING_DIR"
+          # Mask every component of the proxy so it never leaks via curl output.
+          if [ -n "${CHEVERETO_DOWNLOAD_PROXY:-}" ]; then
+            _bare="${CHEVERETO_DOWNLOAD_PROXY#*://}"
+            echo "::add-mask::${_bare}"
+            echo "::add-mask::${_bare%%@*}"
+            echo "::add-mask::${_bare##*@}"
+          fi
+
+          DOWNLOAD_DIR="package"
+          rm -rf "$DOWNLOAD_DIR"
+          mkdir -p "$DOWNLOAD_DIR"
           API_DOWNLOAD="https://chevereto.com/api/download/"
 
+          # GitHub-hosted runner IPs are blocked by Chevereto's Cloudflare, so the
+          # licensed download must egress through the proxy secret.
           echo "Downloading Chevereto package ${VERSION}"
           pushd "$DOWNLOAD_DIR" >/dev/null
-          curl -fsSLJO -H "License: ${CHEVERETO_LICENSE_KEY}" "${API_DOWNLOAD}${VERSION}"
+          curl -fsSLJO --proxy "${CHEVERETO_DOWNLOAD_PROXY}" -H "License: ${CHEVERETO_LICENSE_KEY}" "${API_DOWNLOAD}${VERSION}"
           ZIP_NAME=$(ls -1 *.zip | head -n1)
           if [ -z "$ZIP_NAME" ]; then
             echo "Download did not produce a zip file" >&2
             exit 1
           fi
-          unzip -oq "$ZIP_NAME" -d "../$WORKING_DIR"
-          export ZIP_NAME
           popd >/dev/null
+
           VERSION_FROM_ZIP=$(printf '%s\n' "$ZIP_NAME" | sed -n "s/^chevereto_\([0-9.]*\).*$/\1/p")
           VERSION_FROM_ZIP=${VERSION_FROM_ZIP#v}
           VERSION_FROM_ZIP=${VERSION_FROM_ZIP#V}
@@ -87,8 +100,6 @@ jobs:
             printf 'version=%s\n' "$VERSION_FROM_ZIP"
             printf 'tags=%s\n' "$TAG_LIST"
           } >>"$GITHUB_OUTPUT"
-
-          rm -rf "$DOWNLOAD_DIR"
 
       - name: Show resolved version
         run: |
@@ -143,6 +154,15 @@ jobs:
         if: (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.skip_if_exists == 'true')) && steps.registry.outputs.should_build == 'false'
         run: echo "Chevereto image already up to date on registry."
 
+      - name: Upload Chevereto package
+        if: steps.registry.outputs.should_build != 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: chevereto-package
+          path: package/*.zip
+          if-no-files-found: error
+          retention-days: 1
+
   # Multi-architecture build job
   build:
     needs: prepare
@@ -161,37 +181,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Prepare Chevereto package
-        id: prep
-        env:
-          VERSION_INPUT: ${{ github.event.inputs.version }}
-          CHEVERETO_LICENSE_KEY: ${{ secrets.CHEVERETO_LICENSE_KEY }}
+      - name: Download Chevereto package
+        uses: actions/download-artifact@v4
+        with:
+          name: chevereto-package
+          path: package
+
+      - name: Unpack Chevereto package
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${VERSION_INPUT:-4}"
-          if [ -z "$VERSION" ]; then
-            VERSION="4"
-          fi
-
-          DOWNLOAD_DIR=".temp"
-          WORKING_DIR="chevereto"
-          rm -rf "$DOWNLOAD_DIR" "$WORKING_DIR"
-          mkdir -p "$DOWNLOAD_DIR" "$WORKING_DIR"
-          API_DOWNLOAD="https://chevereto.com/api/download/"
-
-          echo "Downloading Chevereto package ${VERSION}"
-          pushd "$DOWNLOAD_DIR" >/dev/null
-          curl -fsSLJO -H "License: ${CHEVERETO_LICENSE_KEY}" "${API_DOWNLOAD}${VERSION}"
-          ZIP_NAME=$(ls -1 *.zip | head -n1)
+          ZIP_NAME=$(ls -1 package/*.zip | head -n1)
           if [ -z "$ZIP_NAME" ]; then
-            echo "Download did not produce a zip file" >&2
+            echo "Package artifact did not contain a zip file" >&2
             exit 1
           fi
-          unzip -oq "$ZIP_NAME" -d "../$WORKING_DIR"
-          export ZIP_NAME
-          popd >/dev/null
-          rm -rf "$DOWNLOAD_DIR"
+          rm -rf chevereto
+          mkdir -p chevereto
+          unzip -oq "$ZIP_NAME" -d chevereto
+          rm -rf package
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
